@@ -22,9 +22,37 @@ def write(tmp_path, name, rows, kind="NVIDIA", run_id="r1", gpu_name="NVIDIA Tes
     (tmp_path / name).write_text(json.dumps(report))
 
 
-def decide(tmp_path, fail_on="fault", requested="auto"):
+def decide(tmp_path, fail_on="fault", requested="auto", gpus_asked="all"):
     rows, gpus, platforms = verdict.load_reports(str(tmp_path))
-    return verdict.decide(rows, gpus, platforms, fail_on, requested), rows
+    return verdict.decide(rows, gpus, platforms, fail_on, requested, gpus_asked), rows
+
+
+def two_gpu_host(tmp_path, rows):
+    report = {"run_id": "r1", "test_results": rows,
+              "gpu_static_info": [{"id": 0, "type": "NVIDIA", "name": "A"}, {"id": 1, "type": "NVIDIA", "name": "B"}]}
+    (tmp_path / "a.json").write_text(json.dumps(report))
+
+
+def test_a_card_nobody_asked_about_is_not_judged(tmp_path):
+    # The report lists every GPU in the host; only GPU 0 was requested and run.
+    two_gpu_host(tmp_path, [row("memory_read")])
+    result, _ = decide(tmp_path, gpus_asked="0")
+    assert [a["gpu_id"] for a in result["assessments"]] == [0]
+    assert result["verdict"] == "HEALTHY" and not result["failed"]
+
+
+def test_a_requested_card_that_produced_nothing_is_incomplete(tmp_path):
+    two_gpu_host(tmp_path, [row("memory_read")])
+    result, _ = decide(tmp_path, gpus_asked="all")
+    assert [a["verdict"] for a in result["assessments"]] == ["HEALTHY", "INCOMPLETE"]
+    assert result["verdict"] == "INCOMPLETE" and result["failed"]
+
+
+def test_a_requested_card_the_host_does_not_have_is_incomplete(tmp_path):
+    two_gpu_host(tmp_path, [row("memory_read")])
+    result, _ = decide(tmp_path, gpus_asked="0, 5")
+    assert [(a["gpu_id"], a["verdict"]) for a in result["assessments"]] == [(0, "HEALTHY"), (5, "INCOMPLETE")]
+    assert result["assessments"][1]["gpu_name"] == "not found on this runner"
 
 
 def test_healthy_card_passes(tmp_path):

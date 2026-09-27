@@ -170,13 +170,32 @@ def load_reports(report_dir):
     return rows, gpus, platforms
 
 
-def decide(rows, gpus, platforms, fail_on, requested_platform):
+def requested_ids(requested_gpus, gpus):
+    """The GPUs the job asked to have tested.
+
+    A report lists every GPU in the host, tested or not, so the request decides
+    which cards are judged: a card nobody asked about is left out, and a card
+    that was asked about and produced nothing is INCOMPLETE.
+    """
+    text = str(requested_gpus or "all").strip().lower()
+    if text in ("", "all"):
+        return sorted(gpus, key=str)
+    ids = []
+    for part in text.split(","):
+        part = part.strip()
+        if part.isdigit() and int(part) not in ids:
+            ids.append(int(part))
+    return ids
+
+
+def decide(rows, gpus, platforms, fail_on, requested_platform, requested_gpus="all"):
     platform = "unknown"
     for candidate in ("cuda", "hip", "mock"):
         if candidate in platforms:
             platform = candidate
             break
-    assessments = [assess_gpu(rows, gid, name) for gid, name in sorted(gpus.items(), key=lambda kv: str(kv[0]))]
+    assessments = [assess_gpu(rows, gid, gpus.get(gid, "not found on this runner"))
+                   for gid in requested_ids(requested_gpus, gpus)]
     messages = []
     if not rows or not assessments:
         overall = "INCOMPLETE"
@@ -234,12 +253,13 @@ def main(argv=None):
     parser.add_argument("--reports", required=True)
     parser.add_argument("--fail-on", default="fault", choices=["fault", "watch", "never"])
     parser.add_argument("--requested-platform", default="auto")
+    parser.add_argument("--requested-gpus", default="all")
     parser.add_argument("--summary")
     parser.add_argument("--outputs")
     args = parser.parse_args(argv)
 
     rows, gpus, platforms = load_reports(args.reports)
-    result = decide(rows, gpus, platforms, args.fail_on, args.requested_platform)
+    result = decide(rows, gpus, platforms, args.fail_on, args.requested_platform, args.requested_gpus)
     text = render_summary(result, rows)
     print(text)
     if args.summary:

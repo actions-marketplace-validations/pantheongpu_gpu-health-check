@@ -118,9 +118,11 @@ runs:
         REPORT_DIR: ${{ steps.run.outputs.report-dir }}
         FAIL_ON: ${{ inputs.fail-on }}
         REQUESTED_PLATFORM: ${{ inputs.platform }}
+        REQUESTED_GPUS: ${{ inputs.gpu }}
       run: |
         python3 "$GITHUB_ACTION_PATH/verdict.py" --reports "${REPORT_DIR:-/nonexistent}" \
           --fail-on "$FAIL_ON" --requested-platform "$REQUESTED_PLATFORM" \
+          --requested-gpus "$REQUESTED_GPUS" \
           --summary "$GITHUB_STEP_SUMMARY" --outputs "$GITHUB_OUTPUT"
 
     - name: Upload the reports
