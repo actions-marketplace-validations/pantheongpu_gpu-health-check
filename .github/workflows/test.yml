@@ -1,0 +1,96 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m pip install --quiet --break-system-packages pytest
+      - run: python3 -m pytest -q tests
+
+  mock:
+    # GitHub's runners have no GPU, so the action is exercised on Pantheon's CPU
+    # backend: install, compile, run, read the reports, write the summary.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        uses: ./
+        with:
+          platform: mock
+          tests: baseline_metrics, memory_read march_test
+          duration: 5
+          artifact-name: report-${{ matrix.os }}
+      - name: The verdict and the backend are reported
+        env:
+          VERDICT: ${{ steps.check.outputs.verdict }}
+          PLATFORM: ${{ steps.check.outputs.platform }}
+          REPORTS: ${{ steps.check.outputs.report-dir }}
+        run: |
+          test "$VERDICT" = "HEALTHY"
+          test "$PLATFORM" = "mock"
+          ls "$REPORTS"/*.json
+
+  refuses-a-silent-mock:
+    # With no GPU on the runner Pantheon falls back to its CPU backend. A health
+    # check that then passed would be worse than none, so the action must fail.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        uses: ./
+        continue-on-error: true
+        with:
+          tests: memory_read
+          duration: 5
+          upload-report: 'false'
+      - name: The job was failed and says why
+        env:
+          OUTCOME: ${{ steps.check.outcome }}
+          VERDICT: ${{ steps.check.outputs.verdict }}
+        run: |
+          test "$OUTCOME" = "failure"
+          test "$VERDICT" = "NO GPU TESTED"
+
+  never-fails-when-told-not-to:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        uses: ./
+        with:
+          tests: memory_read
+          duration: 5
+          fail-on: never
+          upload-report: 'false'
+      - env:
+          VERDICT: ${{ steps.check.outputs.verdict }}
+        run: test "$VERDICT" = "NO GPU TESTED"
+
+  rejects-a-bad-workload-name:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        uses: ./
+        continue-on-error: true
+        with:
+          platform: mock
+          tests: 'memory_read;id'
+          duration: 5
+          upload-report: 'false'
+      - env:
+          OUTCOME: ${{ steps.check.outcome }}
+        run: test "$OUTCOME" = "failure"

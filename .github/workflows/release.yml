@@ -1,0 +1,24 @@
+name: Release
+
+# Publishing v0.1.2 moves the v0 tag to it, so workflows on @v0 pick up fixes
+# within the same major version and nothing else.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  major-tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Move the major version tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          [[ "$TAG" =~ ^v([0-9]+)\.[0-9]+\.[0-9]+$ ]] || { echo "::error::release tags look like v0.1.0, not '$TAG'"; exit 1; }
+          major="v${BASH_REMATCH[1]}"
+          git tag -f "$major" "$TAG"
+          git push -f origin "refs/tags/$major"

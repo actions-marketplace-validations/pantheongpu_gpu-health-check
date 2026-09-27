@@ -1,0 +1,143 @@
+name: Pantheon GPU Health Check
+description: Stress-test the GPUs on a self-hosted runner before a job trusts them, and fail the job if a card is faulty.
+author: PantheonGPU
+branding:
+  icon: activity
+  color: blue
+
+# Each release of this action pins the Pantheon release it was tested with
+# (the `version` default), so a workflow on @v0 gets the same checks until the
+# next release of the action.
+inputs:
+  version:
+    description: The Pantheon release to install from PyPI (package `pantheon-gpu`).
+    default: '1.2.2'
+  tests:
+    description: >
+      Workloads to run, separated by spaces or commas. Each may be a workload
+      name (`memory_read`), a suite name (`diagnostics`, `memory`, `core`) or
+      `all`. The default is a short check of idle state, memory bandwidth,
+      memory cells, memory retention and FP16 compute.
+    default: baseline_metrics memory_read march_test memory_retention tensor_virus
+  duration:
+    description: Seconds to run each workload.
+    default: '60'
+  gpu:
+    description: Comma-separated GPU ids to test, or `all`.
+    default: all
+  mem:
+    description: Percentage of free GPU memory the workloads may use.
+    default: '99'
+  platform:
+    description: >
+      `auto` detects CUDA or ROCm/HIP. `cuda` or `hip` forces one. `mock` runs
+      the CPU backend with no GPU, which exercises the action and tests nothing.
+    default: auto
+  fail-on:
+    description: >
+      `fault` fails the job when a card is faulty or the check could not run.
+      `watch` also fails it when a card is hot, throttled or logging correctable
+      errors. `never` reports and always passes.
+    default: fault
+  upload-report:
+    description: Upload the JSON reports and summaries as a workflow artifact.
+    default: 'true'
+  artifact-name:
+    description: Name of the uploaded artifact.
+    default: pantheon-gpu-report
+
+outputs:
+  verdict:
+    description: The worst verdict across the tested GPUs. One of HEALTHY, WATCH, FAULT, INCOMPLETE or NO GPU TESTED.
+    value: ${{ steps.verdict.outputs.verdict }}
+  platform:
+    description: The backend the workloads ran on. One of cuda, hip, mock or unknown.
+    value: ${{ steps.verdict.outputs.platform }}
+  report-dir:
+    description: Directory holding the JSON reports.
+    value: ${{ steps.run.outputs.report-dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      name: Install Pantheon
+      shell: bash
+      env:
+        PANTHEON_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        command -v python3 >/dev/null || { echo "::error::python3 is required on the runner"; exit 1; }
+        venv="${RUNNER_TEMP:-/tmp}/pantheon-venv"
+        rm -rf "$venv"
+        if ! python3 -m venv "$venv" >/dev/null 2>&1; then
+          echo "::error::python3 -m venv failed. On Debian and Ubuntu, install the python3-venv package on the runner."
+          exit 1
+        fi
+        "$venv/bin/pip" install --quiet --disable-pip-version-check "pantheon-gpu==${PANTHEON_VERSION}"
+        "$venv/bin/pantheon" --version
+        echo "bin=$venv/bin/pantheon" >> "$GITHUB_OUTPUT"
+
+    - id: run
+      name: Run the workloads
+      shell: bash
+      env:
+        PANTHEON_BIN: ${{ steps.install.outputs.bin }}
+        PANTHEON_TESTS: ${{ inputs.tests }}
+        PANTHEON_DURATION: ${{ inputs.duration }}
+        PANTHEON_GPU: ${{ inputs.gpu }}
+        PANTHEON_MEM: ${{ inputs.mem }}
+        PANTHEON_PLATFORM: ${{ inputs.platform }}
+      run: |
+        set -uo pipefail
+        work="${RUNNER_TEMP:-/tmp}/pantheon-run"
+        rm -rf "$work" && mkdir -p "$work" && cd "$work"
+        echo "report-dir=$work/database" >> "$GITHUB_OUTPUT"
+        echo "work-dir=$work" >> "$GITHUB_OUTPUT"
+        for value in "$PANTHEON_DURATION" "$PANTHEON_MEM"; do
+          [[ "$value" =~ ^[0-9]+$ ]] || { echo "::error::duration and mem must be whole numbers, got '$value'"; exit 1; }
+        done
+        tests="${PANTHEON_TESTS//,/ }"
+        [ -n "${tests// /}" ] || { echo "::error::the tests input is empty"; exit 1; }
+        for test in $tests; do
+          [[ "$test" =~ ^[A-Za-z0-9_]+$ ]] || { echo "::error::'$test' is not a workload or suite name"; exit 1; }
+          echo "::group::pantheon --test $test"
+          "$PANTHEON_BIN" --test "$test" --duration "$PANTHEON_DURATION" --gpu "$PANTHEON_GPU" \
+            --mem "$PANTHEON_MEM" --platform "$PANTHEON_PLATFORM"
+          code=$?
+          echo "::endgroup::"
+          [ "$code" -eq 0 ] || echo "::warning::pantheon exited with status $code on $test"
+        done
+        exit 0
+
+    - id: verdict
+      name: Verdict
+      if: always() && steps.install.outcome == 'success'
+      shell: bash
+      env:
+        REPORT_DIR: ${{ steps.run.outputs.report-dir }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        REQUESTED_PLATFORM: ${{ inputs.platform }}
+      run: |
+        python3 "$GITHUB_ACTION_PATH/verdict.py" --reports "${REPORT_DIR:-/nonexistent}" \
+          --fail-on "$FAIL_ON" --requested-platform "$REQUESTED_PLATFORM" \
+          --summary "$GITHUB_STEP_SUMMARY" --outputs "$GITHUB_OUTPUT"
+
+    - name: Upload the reports
+      if: always() && inputs.upload-report == 'true' && steps.run.outputs.work-dir != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        if-no-files-found: ignore
+        path: |
+          ${{ steps.run.outputs.work-dir }}/database/*.json
+          ${{ steps.run.outputs.work-dir }}/results/*/summary.csv
+
+    - name: Fail the job if the check says so
+      if: steps.verdict.outputs.failed == 'true'
+      shell: bash
+      env:
+        VERDICT: ${{ steps.verdict.outputs.verdict }}
+      run: |
+        echo "::error::GPU health check verdict: $VERDICT"
+        exit 1
