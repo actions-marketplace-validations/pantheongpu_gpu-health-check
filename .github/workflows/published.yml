@@ -1,0 +1,29 @@
+name: Published action
+
+# Uses the action the way a user does, by its published tag, rather than the
+# copy in this checkout. Run after a release, or by hand.
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  by-tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - id: check
+        uses: pantheongpu/gpu-health-check@v0
+        with:
+          platform: mock
+          tests: memory_read march_test
+          duration: 5
+          artifact-name: published-report
+      - env:
+          VERDICT: ${{ steps.check.outputs.verdict }}
+          PLATFORM: ${{ steps.check.outputs.platform }}
+        run: |
+          test "$VERDICT" = "HEALTHY"
+          test "$PLATFORM" = "mock"
