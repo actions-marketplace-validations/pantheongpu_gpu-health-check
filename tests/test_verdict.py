@@ -128,6 +128,41 @@ def test_only_the_idle_baseline_is_incomplete_and_fails(tmp_path):
     assert result["verdict"] == "INCOMPLETE" and result["failed"]
 
 
+def test_workloads_that_were_skipped_are_not_a_pass(tmp_path):
+    # Nothing built or nothing could run: a card nobody measured is not healthy.
+    write(tmp_path, "a.json", [row("baseline_metrics", Score=0.0),
+                               row("fused_attention", Status="SKIP", Unit="SKIP", **{"Skip Reason": "kernel not built"})])
+    result, _ = decide(tmp_path)
+    assessment = result["assessments"][0]
+    assert result["verdict"] == "INCOMPLETE" and result["failed"]
+    assert assessment["findings"]["skipped"] == ["fused_attention"]
+    assert any("skipped" in note for note in assessment["notes"])
+
+
+def test_a_skipped_workload_beside_a_completed_one_is_noted_not_failed(tmp_path):
+    write(tmp_path, "a.json", [row("memory_read"),
+                               row("rt_virus", Status="SKIP", Unit="SKIP", **{"Skip Reason": "no OptiX"})])
+    result, _ = decide(tmp_path)
+    assessment = result["assessments"][0]
+    assert result["verdict"] == "HEALTHY" and not result["failed"]
+    assert assessment["workloads_completed"] == 1 and "1 skipped" in assessment["summary"]
+    assert any("rt_virus was skipped (no OptiX)" in note for note in assessment["notes"])
+
+
+def test_a_combined_limit_reason_that_includes_thermal_is_a_watch(tmp_path):
+    # The label is the most common of the samples, joined with "|" when a sample had several.
+    write(tmp_path, "a.json", [row("memory_read", **{"Limit Reason": "Power|Thermal", "Max Temp (C)": 88.0})])
+    result, _ = decide(tmp_path)
+    assert result["verdict"] == "WATCH" and "thermally throttled" in result["assessments"][0]["reasons"][0]
+
+
+def test_throttling_with_no_recorded_cause_is_noted_not_judged(tmp_path):
+    write(tmp_path, "a.json", [row("memory_read", **{"Throttle Time (s)": 12.0})])
+    result, _ = decide(tmp_path)
+    assert result["verdict"] == "HEALTHY"
+    assert any("throttled for 12 s, cause not recorded" in note for note in result["assessments"][0]["notes"])
+
+
 def test_no_reports_fails_rather_than_passing_silently(tmp_path):
     result, _ = decide(tmp_path)
     assert result["verdict"] == "INCOMPLETE" and result["failed"]

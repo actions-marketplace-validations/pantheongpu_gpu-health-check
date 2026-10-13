@@ -11,7 +11,7 @@ branding:
 inputs:
   version:
     description: The Pantheon release to install from PyPI (package `pantheon-gpu`).
-    default: '1.2.2'
+    default: '1.2.3'
   tests:
     description: >
       Workloads to run, separated by spaces or commas. Each may be a workload
