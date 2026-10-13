@@ -9,6 +9,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 
 DIAGNOSTIC_TESTS = {
@@ -41,11 +42,29 @@ def split_ras_details(delta_text):
     return benign, serious
 
 
+def limit_reason_set(value):
+    """The lower-case labels of a Limit Reason such as "Power|Thermal"."""
+    return {part.strip().lower() for part in str(value or "").split("|") if part.strip()}
+
+
+def is_skipped_row(row):
+    """True for a row of a workload that declined to run, which is not a pass."""
+    return str(row.get("Status") or "").upper() == "SKIP" or row.get("Unit") == "SKIP"
+
+
 def assess_gpu(rows, gpu_id, gpu_name):
+    """Turn one GPU's result rows into a verdict with its evidence.
+
+    Findings are grouped by kind, so a card that is hot on five workloads and
+    slow on nine reads as two lines, worst first, rather than fourteen in the
+    order the workloads happened to run.
+    """
     mine = [r for r in rows if r.get("GPU ID") == gpu_id]
     faults, notes = [], []
     throttled, hot, hot_memory, incomplete = [], [], [], []
     ras_serious, benign_ras = {}, []
+    skipped = []
+    throttle_seconds = {}
     ran = 0
     for row in mine:
         test = row.get("Test Name", "?")
@@ -60,6 +79,12 @@ def assess_gpu(rows, gpu_id, gpu_name):
             else:
                 incomplete.append(test)
             continue
+        if is_skipped_row(row):
+            # It declined to run; there is no measurement and nothing to judge.
+            skipped.append(test)
+            reason = row.get("Skip Reason")
+            notes.append(f"{test} was skipped" + (f" ({reason})" if reason else ""))
+            continue
         if test != "baseline_metrics":
             ran += 1
 
@@ -73,20 +98,32 @@ def assess_gpu(rows, gpu_id, gpu_name):
             if benign:
                 benign_ras.append(test)
 
-        limit = str(row.get("Limit Reason", "") or "")
+        # The reason is the most common label of the samples, joined with "|"
+        # when a sample had several ("Power|Thermal"), so it is read as a set.
+        reasons = limit_reason_set(row.get("Limit Reason"))
         tmax = _num(row.get("Max Temp (C)"))
         tmem = _num(row.get("Max Mem Temp (C)"))
-        if limit.lower() == "thermal":
+        throttle_s = _num(row.get("Throttle Time (s)"))
+        if "thermal" in reasons:
             throttled.append((test, tmax))
+            throttle_seconds[test] = throttle_s
         elif tmax >= THERMAL_WATCH_C:
             hot.append((test, tmax))
+        if throttle_s > 0 and not (reasons - {"none", "n/a", "idle"}):
+            # Throttled for part of the run, but the commonest label of the
+            # samples is "None", so the cause was not recorded. Not a finding
+            # (power-cap throttling is normal under load), but not silent.
+            notes.append(f"{test}: throttled for {throttle_s:.0f} s, cause not recorded")
         if tmem >= MEMORY_THERMAL_WATCH_C:
             hot_memory.append((test, tmem))
 
     watches = []
     if throttled:
         throttled.sort(key=lambda t: -t[1])
-        watches.append("thermal: " + ", ".join(f"{t} thermally throttled, GPU at {c:.0f} C" for t, c in throttled))
+        watches.append("thermal: " + ", ".join(
+            f"{t} thermally throttled, GPU at {c:.0f} C"
+            + (f", {throttle_seconds[t]:.0f} s throttled" if throttle_seconds.get(t, 0) > 0 else "")
+            for t, c in throttled))
     if hot:
         hot.sort(key=lambda t: -t[1])
         watches.append("hot: " + ", ".join(f"{t} GPU reached {c:.0f} C" for t, c in hot))
@@ -94,20 +131,26 @@ def assess_gpu(rows, gpu_id, gpu_name):
         hot_memory.sort(key=lambda t: -t[1])
         watches.append("hot memory: " + ", ".join(f"{t} memory reached {c:.0f} C" for t, c in hot_memory))
     if ras_serious:
-        totals = {}
+        totals, events = {}, []
         for details in ras_serious.values():
             for item in details:
-                name, _, delta = item.rpartition(" ")
+                counted = re.match(r"^(.*\S)\s+\+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)$", item)
+                if not counted:
+                    # An event line, not a counter: keep its words, not a "+0".
+                    if item not in events:
+                        events.append(item if len(item) <= 120 else item[:117] + "...")
+                    continue
+                name = counted.group(1)
                 short = name.split(".")[-2] + "." + name.split(".")[-1] if name.count(".") >= 2 else name
-                totals[short] = totals.get(short, 0) + _num(delta.lstrip("+"))
-        watches.append(f"correctable errors on {len(ras_serious)} workload(s): "
-                       + ", ".join(f"{k} +{v:g}" for k, v in sorted(totals.items(), key=lambda kv: -kv[1])))
+                totals[short] = totals.get(short, 0) + _num(counted.group(2))
+        parts = [f"{k} +{v:g}" for k, v in sorted(totals.items(), key=lambda kv: -kv[1])] + events
+        watches.append(f"correctable errors on {len(ras_serious)} workload(s): " + ", ".join(parts))
     if incomplete:
         watches.append("did not complete: " + ", ".join(incomplete))
+
     if benign_ras:
         notes.append(f"PCIe link recovery events on {len(benign_ras)} workload(s): "
                      "link power-state cycling, not a fault")
-
     if faults:
         verdict = "FAULT"
     elif watches:
@@ -116,24 +159,44 @@ def assess_gpu(rows, gpu_id, gpu_name):
         verdict = "HEALTHY"
     else:
         verdict = "INCOMPLETE"
-        notes.append("no workload beyond the idle baseline completed")
+        if skipped:
+            notes.append(f"nothing ran: {len(skipped)} workload(s) skipped ({', '.join(skipped)})")
+        else:
+            notes.append("nothing ran: no workload beyond the idle baseline completed")
 
-    bits = []
+    summary_bits = []
     if faults:
-        bits.append(f"{len(faults)} fault(s)")
+        summary_bits.append(f"{len(faults)} fault(s)")
     if throttled:
-        bits.append(f"thermally throttled on {len(throttled)}")
+        summary_bits.append(f"thermally throttled on {len(throttled)}")
     if hot or hot_memory:
-        bits.append(f"hot on {len(hot) + len(hot_memory)}")
+        summary_bits.append(f"hot on {len(hot) + len(hot_memory)}")
     if ras_serious:
-        bits.append(f"correctable errors on {len(ras_serious)}")
+        summary_bits.append(f"correctable errors on {len(ras_serious)}")
     if incomplete:
-        bits.append(f"{len(incomplete)} incomplete")
+        summary_bits.append(f"{len(incomplete)} incomplete")
+    if skipped and verdict != "INCOMPLETE":
+        summary_bits.append(f"{len(skipped)} skipped")
+    if verdict == "INCOMPLETE" and skipped:
+        summary_bits.append("nothing ran")
     if verdict == "HEALTHY":
-        bits.append(f"{ran} workload(s) completed")
-    return {"gpu_id": gpu_id, "gpu_name": gpu_name, "verdict": verdict,
-            "summary": "; ".join(bits), "reasons": faults + watches, "notes": notes,
-            "workloads_completed": ran}
+        summary_bits.append(f"{ran} workload(s) completed")
+
+    return {
+        "gpu_id": gpu_id, "gpu_name": gpu_name, "verdict": verdict,
+        "summary": "; ".join(summary_bits),
+        "reasons": faults + watches, "notes": notes,
+        "findings": {
+            "faults": faults,
+            "throttled": [{"test": t, "temp_c": c} for t, c in throttled],
+            "hot": [{"test": t, "temp_c": c} for t, c in hot],
+            "hot_memory": [{"test": t, "temp_c": c} for t, c in hot_memory],
+            "correctable_errors": ras_serious,
+            "incomplete": incomplete,
+            "skipped": skipped,
+        },
+        "workloads_completed": ran,
+    }
 
 
 def load_reports(report_dir):
