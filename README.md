@@ -51,7 +51,7 @@ tested.
 | `mem` | `99` | Percentage of free GPU memory the workloads may use. |
 | `fail-on` | `fault` | `fault`, `watch` or `never`. |
 | `platform` | `auto` | `auto`, `cuda`, `hip` or `mock`. |
-| `version` | `1.2.3` | The Pantheon release to install. |
+| `version` | `1.2.4` | The Pantheon release to install. |
 | `upload-report` | `true` | Keep the JSON reports as a workflow artifact. |
 | `artifact-name` | `pantheon-gpu-report` | Change it when a job runs the action more than once. |
 
